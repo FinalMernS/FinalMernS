@@ -1,48 +1,63 @@
 import mongoose from 'mongoose';
 import { MongoMemoryServer } from 'mongodb-memory-server';
-import { Order } from '../src/models/Order';
-import { Book } from '../src/models/Book';
-import { User } from '../src/models/User';
-import { Author } from '../src/models/Author';
-import { orderResolvers } from '../src/resolvers/order';
-import { AppError, ErrorCode } from '../src/utils/errors';
+import supertest from 'supertest';
+import { createTestServer } from './test-server';
+import { generateToken } from '../src/utils/auth';
 
-describe('Order Resolvers', () => {
+describe('Order GraphQL', () => {
   let mongoServer: MongoMemoryServer;
-  let testUser: any;
-  let testAuthor: any;
-  let testBook: any;
-  let userContext: any;
-  let adminContext: any;
+  let request: supertest.Agent;
+  let userToken: string;
+  let testUserId: string;
+  let testBookId: string;
+
+  jest.setTimeout(120000); // 120 seconds timeout for MongoDB setup
 
   beforeAll(async () => {
     mongoServer = await MongoMemoryServer.create();
     const mongoUri = mongoServer.getUri();
     await mongoose.connect(mongoUri);
+
+    const app = await createTestServer();
+    request = supertest(app);
   });
 
   afterAll(async () => {
     await mongoose.disconnect();
-    await mongoServer.stop();
+    if (mongoServer) {
+      await mongoServer.stop();
+    }
   });
 
   beforeEach(async () => {
+    const { Order } = await import('../src/models/Order');
+    const { Book } = await import('../src/models/Book');
+    const { User } = await import('../src/models/User');
+    const { Author } = await import('../src/models/Author');
+
     await Order.deleteMany({});
     await Book.deleteMany({});
     await User.deleteMany({});
     await Author.deleteMany({});
 
-    testUser = await User.create({
+    const testUser = await User.create({
       email: 'user@test.com',
       password: 'password123',
       name: 'Test User',
     });
 
-    testAuthor = await Author.create({
+    testUserId = testUser._id.toString();
+    userToken = generateToken({
+      userId: testUserId,
+      email: testUser.email,
+      role: 'USER',
+    });
+
+    const testAuthor = await Author.create({
       name: 'Test Author',
     });
 
-    testBook = await Book.create({
+    const testBook = await Book.create({
       title: 'Test Book',
       description: 'Test description',
       isbn: '1234567890123',
@@ -51,99 +66,154 @@ describe('Order Resolvers', () => {
       authorId: testAuthor._id,
     });
 
-    userContext = {
-      user: {
-        userId: testUser._id.toString(),
-        email: testUser.email,
-        role: 'USER',
-      },
-    };
-
-    adminContext = {
-      user: {
-        userId: 'admin123',
-        email: 'admin@test.com',
-        role: 'ADMIN',
-      },
-    };
+    testBookId = testBook._id.toString();
   });
 
-  describe('createOrder', () => {
+  describe('createOrder mutation', () => {
     it('should create an order successfully', async () => {
-      const input = {
-        items: [
-          {
-            bookId: testBook._id.toString(),
-            quantity: 2,
+      const mutation = `
+        mutation CreateOrder($input: CreateOrderInput!) {
+          createOrder(input: $input) {
+            id
+            items {
+              bookId
+              quantity
+              price
+            }
+            totalAmount
+            status
+          }
+        }
+      `;
+
+      const variables = {
+        input: {
+          items: [
+            {
+              bookId: testBookId,
+              quantity: 2,
+            },
+          ],
+          shippingAddress: {
+            street: '123 Main St',
+            city: 'New York',
+            zipCode: '10001',
+            country: 'USA',
           },
-        ],
-        shippingAddress: {
-          street: '123 Main St',
-          city: 'New York',
-          zipCode: '10001',
-          country: 'USA',
         },
       };
 
-      const result = await orderResolvers.Mutation.createOrder(null, { input }, userContext);
+      const res = await request
+        .post('/graphql')
+        .set('Authorization', `Bearer ${userToken}`)
+        .send({ query: mutation, variables });
 
-      expect(result).not.toBeNull();
-      expect(result!.items.length).toBe(1);
-      expect(result!.totalAmount).toBe(testBook.price * 2);
-      expect(result!.status).toBe('PENDING');
+      expect(res.status).toBe(200);
+      expect(res.body.data).toBeDefined();
+      expect(res.body.data.createOrder).toBeDefined();
+      expect(res.body.data.createOrder.items.length).toBe(1);
+      expect(res.body.data.createOrder.totalAmount).toBe(39.98);
+      expect(res.body.data.createOrder.status).toBe('PENDING');
     });
 
     it('should update book stock after creating order', async () => {
-      const initialStock = testBook.stock;
+      const { Book } = await import('../src/models/Book');
+      const initialBook = await Book.findById(testBookId);
+      const initialStock = initialBook!.stock;
       const quantity = 3;
 
-      const input = {
-        items: [
-          {
-            bookId: testBook._id.toString(),
-            quantity,
+      const mutation = `
+        mutation CreateOrder($input: CreateOrderInput!) {
+          createOrder(input: $input) {
+            id
+            items {
+              bookId
+              quantity
+            }
+          }
+        }
+      `;
+
+      const variables = {
+        input: {
+          items: [
+            {
+              bookId: testBookId,
+              quantity,
+            },
+          ],
+          shippingAddress: {
+            street: '123 Main St',
+            city: 'New York',
+            zipCode: '10001',
+            country: 'USA',
           },
-        ],
-        shippingAddress: {
-          street: '123 Main St',
-          city: 'New York',
-          zipCode: '10001',
-          country: 'USA',
         },
       };
 
-      await orderResolvers.Mutation.createOrder(null, { input }, userContext);
+      await request
+        .post('/graphql')
+        .set('Authorization', `Bearer ${userToken}`)
+        .send({ query: mutation, variables });
 
-      const updatedBook = await Book.findById(testBook._id);
+      const updatedBook = await Book.findById(testBookId);
       expect(updatedBook?.stock).toBe(initialStock - quantity);
     });
 
     it('should throw error if insufficient stock', async () => {
-      const input = {
-        items: [
-          {
-            bookId: testBook._id.toString(),
-            quantity: 100,
+      const mutation = `
+        mutation CreateOrder($input: CreateOrderInput!) {
+          createOrder(input: $input) {
+            id
+            items {
+              bookId
+              quantity
+            }
+          }
+        }
+      `;
+
+      const variables = {
+        input: {
+          items: [
+            {
+              bookId: testBookId,
+              quantity: 100,
+            },
+          ],
+          shippingAddress: {
+            street: '123 Main St',
+            city: 'New York',
+            zipCode: '10001',
+            country: 'USA',
           },
-        ],
-        shippingAddress: {
-          street: '123 Main St',
-          city: 'New York',
-          zipCode: '10001',
-          country: 'USA',
         },
       };
 
-      await expect(orderResolvers.Mutation.createOrder(null, { input }, userContext)).rejects.toThrow(AppError);
+      const res = await request
+        .post('/graphql')
+        .set('Authorization', `Bearer ${userToken}`)
+        .send({ query: mutation, variables });
+
+      expect(res.status).toBe(200);
+      expect(res.body.errors).toBeDefined();
+      expect(res.body.errors[0].message).toContain('stock');
     });
   });
 
-  describe('myOrders', () => {
+  describe('myOrders query', () => {
     it('should return orders for the authenticated user', async () => {
+      const { Order } = await import('../src/models/Order');
+      const { Book } = await import('../src/models/Book');
+      const { User } = await import('../src/models/User');
+
+      const user = await User.findOne({ email: 'user@test.com' });
+      const book = await Book.findById(testBookId);
+
       await Order.create({
-        userId: testUser._id,
-        items: [{ bookId: testBook._id, quantity: 1, price: testBook.price }],
-        totalAmount: testBook.price,
+        userId: user!._id,
+        items: [{ bookId: book!._id, quantity: 1, price: book!.price }],
+        totalAmount: book!.price,
         status: 'PENDING',
         shippingAddress: {
           street: '123 Main St',
@@ -153,11 +223,29 @@ describe('Order Resolvers', () => {
         },
       });
 
-      const result = await orderResolvers.Query.myOrders(null, null, userContext);
+      const query = `
+        query {
+          myOrders {
+            id
+            items {
+              bookId
+              quantity
+            }
+            totalAmount
+            status
+          }
+        }
+      `;
 
-      expect(result.length).toBe(1);
+      const res = await request
+        .post('/graphql')
+        .set('Authorization', `Bearer ${userToken}`)
+        .send({ query });
+
+      expect(res.status).toBe(200);
+      expect(res.body.data).toBeDefined();
+      expect(res.body.data.myOrders).toBeDefined();
+      expect(res.body.data.myOrders.length).toBe(1);
     });
   });
 });
-
-

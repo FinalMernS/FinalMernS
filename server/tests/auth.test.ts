@@ -1,132 +1,273 @@
 import mongoose from 'mongoose';
 import { MongoMemoryServer } from 'mongodb-memory-server';
-import { User } from '../src/models/User';
-import { authResolvers } from '../src/resolvers/auth';
-import { generateToken } from '../src/utils/auth';
-import { AppError, ErrorCode } from '../src/utils/errors';
+import supertest from 'supertest';
+import { createTestServer } from './test-server';
 
-describe('Auth Resolvers', () => {
+describe('Auth GraphQL', () => {
   let mongoServer: MongoMemoryServer;
+  let request: supertest.Agent;
+
+  jest.setTimeout(120000); // 120 seconds timeout for MongoDB setup
 
   beforeAll(async () => {
     mongoServer = await MongoMemoryServer.create();
     const mongoUri = mongoServer.getUri();
     await mongoose.connect(mongoUri);
+
+    const app = await createTestServer();
+    request = supertest(app);
   });
 
   afterAll(async () => {
     await mongoose.disconnect();
-    await mongoServer.stop();
+    if (mongoServer) {
+      await mongoServer.stop();
+    }
   });
 
   beforeEach(async () => {
+    const { User } = await import('../src/models/User');
     await User.deleteMany({});
   });
 
-  describe('register', () => {
+  describe('register mutation', () => {
     it('should register a new user successfully', async () => {
-      const input = {
-        email: 'test@example.com',
-        password: 'password123',
-        name: 'Test User',
+      const mutation = `
+        mutation Register($input: RegisterInput!) {
+          register(input: $input) {
+            token
+            user {
+              id
+              email
+              name
+              role
+            }
+          }
+        }
+      `;
+
+      const variables = {
+        input: {
+          email: 'test@example.com',
+          password: 'password123',
+          name: 'Test User',
+        },
       };
 
-      const result = await authResolvers.Mutation.register(null, { input }, undefined);
+      const res = await request
+        .post('/graphql')
+        .send({ query: mutation, variables });
 
-      expect(result).toHaveProperty('token');
-      expect(result.user.email).toBe(input.email);
-      expect(result.user.name).toBe(input.name);
-      expect(result.user.role).toBe('USER');
+      expect(res.status).toBe(200);
+      expect(res.body.data).toBeDefined();
+      expect(res.body.data.register).toBeDefined();
+      expect(res.body.data.register.token).toBeDefined();
+      expect(res.body.data.register.user.email).toBe(variables.input.email);
+      expect(res.body.data.register.user.name).toBe(variables.input.name);
+      expect(res.body.data.register.user.role).toBe('USER');
     });
 
     it('should throw error if email already exists', async () => {
+      const { User } = await import('../src/models/User');
       await User.create({
         email: 'test@example.com',
         password: 'password123',
         name: 'Existing User',
       });
 
-      const input = {
-        email: 'test@example.com',
-        password: 'password123',
-        name: 'New User',
+      const mutation = `
+        mutation Register($input: RegisterInput!) {
+          register(input: $input) {
+            token
+            user {
+              id
+              email
+              name
+            }
+          }
+        }
+      `;
+
+      const variables = {
+        input: {
+          email: 'test@example.com',
+          password: 'password123',
+          name: 'New User',
+        },
       };
 
-      await expect(authResolvers.Mutation.register(null, { input }, undefined)).rejects.toThrow(AppError);
+      const res = await request
+        .post('/graphql')
+        .send({ query: mutation, variables });
+
+      expect(res.status).toBe(200);
+      expect(res.body.errors).toBeDefined();
+      expect(res.body.errors[0].message).toContain('already exists');
     });
   });
 
-  describe('login', () => {
+  describe('login mutation', () => {
     it('should login successfully with correct credentials', async () => {
-      const user = await User.create({
-        email: 'test@example.com',
-        password: 'password123',
-        name: 'Test User',
-      });
-
-      const input = {
-        email: 'test@example.com',
-        password: 'password123',
-      };
-
-      const result = await authResolvers.Mutation.login(null, { input }, undefined);
-
-      expect(result).toHaveProperty('token');
-      expect(result.user.email).toBe(input.email);
-    });
-
-    it('should throw error with incorrect password', async () => {
+      const { User } = await import('../src/models/User');
       await User.create({
         email: 'test@example.com',
         password: 'password123',
         name: 'Test User',
       });
 
-      const input = {
-        email: 'test@example.com',
-        password: 'wrongpassword',
+      const mutation = `
+        mutation Login($input: LoginInput!) {
+          login(input: $input) {
+            token
+            user {
+              id
+              email
+              name
+            }
+          }
+        }
+      `;
+
+      const variables = {
+        input: {
+          email: 'test@example.com',
+          password: 'password123',
+        },
       };
 
-      await expect(authResolvers.Mutation.login(null, { input }, undefined)).rejects.toThrow(AppError);
+      const res = await request
+        .post('/graphql')
+        .send({ query: mutation, variables });
+
+      expect(res.status).toBe(200);
+      expect(res.body.data).toBeDefined();
+      expect(res.body.data.login).toBeDefined();
+      expect(res.body.data.login.token).toBeDefined();
+      expect(res.body.data.login.user.email).toBe(variables.input.email);
+    });
+
+    it('should throw error with incorrect password', async () => {
+      const { User } = await import('../src/models/User');
+      await User.create({
+        email: 'test@example.com',
+        password: 'password123',
+        name: 'Test User',
+      });
+
+      const mutation = `
+        mutation Login($input: LoginInput!) {
+          login(input: $input) {
+            token
+            user {
+              id
+              email
+            }
+          }
+        }
+      `;
+
+      const variables = {
+        input: {
+          email: 'test@example.com',
+          password: 'wrongpassword',
+        },
+      };
+
+      const res = await request
+        .post('/graphql')
+        .send({ query: mutation, variables });
+
+      expect(res.status).toBe(200);
+      expect(res.body.errors).toBeDefined();
+      expect(res.body.errors[0].message).toContain('Invalid');
     });
 
     it('should throw error with non-existent email', async () => {
-      const input = {
-        email: 'nonexistent@example.com',
-        password: 'password123',
+      const mutation = `
+        mutation Login($input: LoginInput!) {
+          login(input: $input) {
+            token
+            user {
+              id
+              email
+            }
+          }
+        }
+      `;
+
+      const variables = {
+        input: {
+          email: 'nonexistent@example.com',
+          password: 'password123',
+        },
       };
 
-      await expect(authResolvers.Mutation.login(null, { input }, undefined)).rejects.toThrow(AppError);
+      const res = await request
+        .post('/graphql')
+        .send({ query: mutation, variables });
+
+      expect(res.status).toBe(200);
+      expect(res.body.errors).toBeDefined();
     });
   });
 
-  describe('me', () => {
+  describe('me query', () => {
     it('should return user when authenticated', async () => {
+      const { User } = await import('../src/models/User');
+      const { generateToken } = await import('../src/utils/auth');
+      
       const user = await User.create({
         email: 'test@example.com',
         password: 'password123',
         name: 'Test User',
       });
 
-      const context = {
-        user: {
-          userId: user._id.toString(),
-          email: user.email,
-          role: user.role,
-        },
-      };
+      const token = generateToken({
+        userId: user._id.toString(),
+        email: user.email,
+        role: user.role,
+      });
 
-      const result = await authResolvers.Query.me(null, null, context as any);
+      const query = `
+        query {
+          me {
+            id
+            email
+            name
+            role
+          }
+        }
+      `;
 
-      expect(result).toBeDefined();
-      expect(result?.email).toBe(user.email);
+      const res = await request
+        .post('/graphql')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ query });
+
+      expect(res.status).toBe(200);
+      expect(res.body.data).toBeDefined();
+      expect(res.body.data.me).toBeDefined();
+      expect(res.body.data.me.email).toBe(user.email);
     });
 
     it('should return null when not authenticated', async () => {
-      const result = await authResolvers.Query.me(null, null, {} as any);
-      expect(result).toBeNull();
+      const query = `
+        query {
+          me {
+            id
+            email
+            name
+          }
+        }
+      `;
+
+      const res = await request
+        .post('/graphql')
+        .send({ query });
+
+      expect(res.status).toBe(200);
+      expect(res.body.data).toBeDefined();
+      expect(res.body.data.me).toBeNull();
     });
   });
 });
-
-
