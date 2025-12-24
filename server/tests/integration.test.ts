@@ -1,28 +1,37 @@
 import mongoose from 'mongoose';
 import { MongoMemoryServer } from 'mongodb-memory-server';
-import { User } from '../src/models/User';
-import { Author } from '../src/models/Author';
-import { Book } from '../src/models/Book';
-import { Order } from '../src/models/Order';
-import { authResolvers } from '../src/resolvers/auth';
-import { bookResolvers } from '../src/resolvers/book';
-import { orderResolvers } from '../src/resolvers/order';
+import supertest from 'supertest';
+import { createTestServer } from './test-server';
+import { generateToken } from '../src/utils/auth';
 
-describe('Integration Tests', () => {
+describe('Integration GraphQL Tests', () => {
   let mongoServer: MongoMemoryServer;
+  let request: supertest.Agent;
+
+  jest.setTimeout(120000); // 120 seconds timeout for MongoDB setup
 
   beforeAll(async () => {
     mongoServer = await MongoMemoryServer.create();
     const mongoUri = mongoServer.getUri();
     await mongoose.connect(mongoUri);
+
+    const app = await createTestServer();
+    request = supertest(app);
   });
 
   afterAll(async () => {
     await mongoose.disconnect();
-    await mongoServer.stop();
+    if (mongoServer) {
+      await mongoServer.stop();
+    }
   });
 
   beforeEach(async () => {
+    const { User } = await import('../src/models/User');
+    const { Author } = await import('../src/models/Author');
+    const { Book } = await import('../src/models/Book');
+    const { Order } = await import('../src/models/Order');
+
     await User.deleteMany({});
     await Author.deleteMany({});
     await Book.deleteMany({});
@@ -31,97 +40,190 @@ describe('Integration Tests', () => {
 
   it('should create a complete order flow', async () => {
     // 1. Register a user
-    const registerResult = await authResolvers.Mutation.register(
-      null,
-      {
-        input: {
-          email: 'test@example.com',
-          password: 'password123',
-          name: 'Test User',
+    const registerMutation = `
+      mutation Register($input: RegisterInput!) {
+        register(input: $input) {
+          token
+          user {
+            id
+            email
+            name
+            role
+          }
+        }
+      }
+    `;
+
+    const registerRes = await request
+      .post('/graphql')
+      .send({
+        query: registerMutation,
+        variables: {
+          input: {
+            email: 'test@example.com',
+            password: 'password123',
+            name: 'Test User',
+          },
         },
-      },
-      undefined
-    );
+      });
 
-    expect(registerResult.user).toBeDefined();
-    expect(registerResult.token).toBeDefined();
+    expect(registerRes.status).toBe(200);
+    expect(registerRes.body.data.register).toBeDefined();
+    expect(registerRes.body.data.register.token).toBeDefined();
+    expect(registerRes.body.data.register.user.email).toBe('test@example.com');
 
-    const userContext = {
-      user: {
-        userId: registerResult.user._id.toString(),
-        email: registerResult.user.email,
-        role: registerResult.user.role,
-      },
-    };
+    const userToken = registerRes.body.data.register.token;
+    const userId = registerRes.body.data.register.user.id;
 
-    const adminContext = {
-      user: {
-        userId: 'admin123',
-        email: 'admin@test.com',
-        role: 'ADMIN',
-      },
-    };
+    // 2. Create an admin user and author
+    const { User } = await import('../src/models/User');
+    const { Author } = await import('../src/models/Author');
 
-    // 2. Create an author (admin)
+    const adminUser = await User.create({
+      email: 'admin@test.com',
+      password: 'password123',
+      name: 'Admin User',
+      role: 'ADMIN',
+    });
+
+    const adminToken = generateToken({
+      userId: adminUser._id.toString(),
+      email: adminUser.email,
+      role: adminUser.role,
+    });
+
     const author = await Author.create({
       name: 'Test Author',
       bio: 'Test bio',
     });
 
     // 3. Create a book (admin)
-    const bookResult = await bookResolvers.Mutation.createBook(
-      null,
-      {
-        input: {
-          title: 'Test Book',
-          description: 'Test description',
-          isbn: '1234567890123',
-          price: 19.99,
-          stock: 10,
-          authorId: author._id.toString(),
-        },
-      },
-      adminContext
-    );
+    const createBookMutation = `
+      mutation CreateBook($input: CreateBookInput!) {
+        createBook(input: $input) {
+          id
+          title
+          price
+          stock
+          author {
+            id
+            name
+          }
+        }
+      }
+    `;
 
-    expect(bookResult).not.toBeNull();
-    expect(bookResult!.title).toBe('Test Book');
-
-    // 4. Create an order (user)
-    const orderResult = await orderResolvers.Mutation.createOrder(
-      null,
-      {
-        input: {
-          items: [
-            {
-              bookId: bookResult!._id.toString(),
-              quantity: 2,
-            },
-          ],
-          shippingAddress: {
-            street: '123 Main St',
-            city: 'New York',
-            zipCode: '10001',
-            country: 'USA',
+    const bookRes = await request
+      .post('/graphql')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        query: createBookMutation,
+        variables: {
+          input: {
+            title: 'Test Book',
+            description: 'Test description',
+            isbn: '1234567890123',
+            price: 19.99,
+            stock: 10,
+            authorId: author._id.toString(),
           },
         },
-      },
-      userContext
-    );
+      });
 
-    expect(orderResult).not.toBeNull();
-    expect(orderResult!.items.length).toBe(1);
-    expect(orderResult!.totalAmount).toBe(19.99 * 2);
+    expect(bookRes.status).toBe(200);
+    expect(bookRes.body.data.createBook).toBeDefined();
+    expect(bookRes.body.data.createBook.title).toBe('Test Book');
+    expect(bookRes.body.data.createBook.stock).toBe(10);
+
+    const bookId = bookRes.body.data.createBook.id;
+
+    // 4. Create an order (user)
+    const createOrderMutation = `
+      mutation CreateOrder($input: CreateOrderInput!) {
+        createOrder(input: $input) {
+          id
+          items {
+            bookId
+            quantity
+            price
+          }
+          totalAmount
+          status
+        }
+      }
+    `;
+
+    const orderRes = await request
+      .post('/graphql')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({
+        query: createOrderMutation,
+        variables: {
+          input: {
+            items: [
+              {
+                bookId: bookId,
+                quantity: 2,
+              },
+            ],
+            shippingAddress: {
+              street: '123 Main St',
+              city: 'New York',
+              zipCode: '10001',
+              country: 'USA',
+            },
+          },
+        },
+      });
+
+    expect(orderRes.status).toBe(200);
+    expect(orderRes.body.data.createOrder).toBeDefined();
+    expect(orderRes.body.data.createOrder.items.length).toBe(1);
+    expect(orderRes.body.data.createOrder.totalAmount).toBe(39.98);
+    expect(orderRes.body.data.createOrder.status).toBe('PENDING');
 
     // 5. Verify book stock was updated
-    const updatedBook = await Book.findById(bookResult!._id);
-    expect(updatedBook?.stock).toBe(8);
+    const bookQuery = `
+      query Book($id: ID!) {
+        book(id: $id) {
+          id
+          stock
+        }
+      }
+    `;
+
+    const bookQueryRes = await request
+      .post('/graphql')
+      .send({
+        query: bookQuery,
+        variables: { id: bookId },
+      });
+
+    expect(bookQueryRes.status).toBe(200);
+    expect(bookQueryRes.body.data.book.stock).toBe(8);
 
     // 6. Get user orders
-    const orders = await orderResolvers.Query.myOrders(null, null, userContext);
-    expect(orders.length).toBe(1);
-    expect(orders[0]._id.toString()).toBe(orderResult!._id.toString());
+    const myOrdersQuery = `
+      query {
+        myOrders {
+          id
+          items {
+            bookId
+            quantity
+          }
+          totalAmount
+        }
+      }
+    `;
+
+    const ordersRes = await request
+      .post('/graphql')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ query: myOrdersQuery });
+
+    expect(ordersRes.status).toBe(200);
+    expect(ordersRes.body.data.myOrders).toBeDefined();
+    expect(ordersRes.body.data.myOrders.length).toBe(1);
+    expect(ordersRes.body.data.myOrders[0].totalAmount).toBe(39.98);
   });
 });
-
-
